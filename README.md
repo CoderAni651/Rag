@@ -1,47 +1,19 @@
 import streamlit as st
 from PyPDF2 import PdfReader
-import pandas as pd
-import base64
-import asyncio
-from datetime import datetime
+import google.generativeai as genai
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import DocArrayInMemorySearch
-from langchain.embeddings.base import Embeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-
-
-# ---------------- FIX ASYNC ISSUE ---------------- #
-
-try:
-    asyncio.get_running_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-
-# ---------------- SIMPLE EMBEDDINGS ---------------- #
-
-class SimpleEmbeddings(Embeddings):
-
-    def embed_documents(self, texts):
-        return [[float(len(text))] * 10 for text in texts]
-
-    def embed_query(self, text):
-        return [float(len(text))] * 10
-
-
-# ---------------- PDF TEXT EXTRACTION ---------------- #
+# ---------------- PDF TEXT ---------------- #
 
 def get_pdf_text(pdf_docs):
 
     text = ""
 
     for pdf in pdf_docs:
+
         pdf_reader = PdfReader(pdf)
 
         for page in pdf_reader.pages:
+
             extracted = page.extract_text()
 
             if extracted:
@@ -50,44 +22,57 @@ def get_pdf_text(pdf_docs):
     return text
 
 
-# ---------------- TEXT CHUNKING ---------------- #
+# ---------------- SIMPLE CHUNKING ---------------- #
 
-def get_text_chunks(text):
+def chunk_text(text, chunk_size=3000):
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200
-    )
+    chunks = []
 
-    chunks = text_splitter.split_text(text)
+    for i in range(0, len(text), chunk_size):
+
+        chunks.append(text[i:i + chunk_size])
 
     return chunks
 
 
-# ---------------- VECTOR STORE ---------------- #
+# ---------------- SIMPLE SEARCH ---------------- #
 
-def get_vector_store(text_chunks):
+def find_relevant_chunks(chunks, question):
 
-    embeddings = SimpleEmbeddings()
+    question_words = question.lower().split()
 
-    vector_store = DocArrayInMemorySearch.from_texts(
-        text_chunks,
-        embedding=embeddings
-    )
+    scored_chunks = []
 
-    return vector_store
+    for chunk in chunks:
+
+        score = 0
+
+        chunk_lower = chunk.lower()
+
+        for word in question_words:
+
+            if word in chunk_lower:
+                score += 1
+
+        scored_chunks.append((score, chunk))
+
+    scored_chunks.sort(reverse=True)
+
+    top_chunks = [chunk for score, chunk in scored_chunks[:3]]
+
+    return "\n".join(top_chunks)
 
 
-# ---------------- QA CHAIN ---------------- #
+# ---------------- GEMINI RESPONSE ---------------- #
 
-def get_conversational_chain(api_key):
+def ask_gemini(api_key, context, question):
 
-    prompt_template = """
-    Answer the question as detailed as possible from the provided context.
+    genai.configure(api_key=api_key)
 
-    If the answer is not in the provided context,
-    say:
-    "Answer is not available in the context."
+    model = genai.GenerativeModel("gemini-2.0-flash")
+
+    prompt = f"""
+    Answer the question using the context below.
 
     Context:
     {context}
@@ -95,175 +80,74 @@ def get_conversational_chain(api_key):
     Question:
     {question}
 
-    Answer:
+    If answer is not found, say:
+    "Answer not available in context."
     """
 
-    model = ChatGoogleGenerativeAI(
-        model="gemini-2.0-flash",
-        temperature=0.3,
-        google_api_key=api_key
-    )
+    response = model.generate_content(prompt)
 
-    prompt = PromptTemplate(
-        template=prompt_template,
-        input_variables=["context", "question"]
-    )
-
-    chain = load_qa_chain(
-        model,
-        chain_type="stuff",
-        prompt=prompt
-    )
-
-    return chain
+    return response.text
 
 
-# ---------------- USER QUESTION ---------------- #
-
-def user_input(user_question, api_key, pdf_docs):
-
-    if not api_key:
-        st.warning("Please enter Google API Key")
-        return
-
-    if not pdf_docs:
-        st.warning("Please upload PDF files")
-        return
-
-    # Extract text
-    raw_text = get_pdf_text(pdf_docs)
-
-    # Chunking
-    text_chunks = get_text_chunks(raw_text)
-
-    # Vector DB
-    vector_store = get_vector_store(text_chunks)
-
-    # Search docs
-    docs = vector_store.similarity_search(user_question)
-
-    # QA chain
-    chain = get_conversational_chain(api_key)
-
-    response = chain(
-        {
-            "input_documents": docs,
-            "question": user_question
-        },
-        return_only_outputs=True
-    )
-
-    answer = response["output_text"]
-
-    # Store history
-    st.session_state.conversation_history.append(
-        {
-            "Question": user_question,
-            "Answer": answer,
-            "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-    )
-
-    # Display
-    st.markdown("## Question")
-    st.write(user_question)
-
-    st.markdown("## Answer")
-    st.write(answer)
-
-    st.success("Done")
-
-
-# ---------------- MAIN APP ---------------- #
+# ---------------- MAIN ---------------- #
 
 def main():
 
-    st.set_page_config(
-        page_title="RAG PDF Chatbot",
-        page_icon="📚"
+    st.set_page_config(page_title="PDF Chatbot")
+
+    st.title("Chat with PDF")
+
+    api_key = st.sidebar.text_input(
+        "Enter Google API Key",
+        type="password"
     )
 
-    st.header("Chat with PDF using Gemini 📚")
+    pdf_docs = st.sidebar.file_uploader(
+        "Upload PDFs",
+        accept_multiple_files=True
+    )
 
-    if "conversation_history" not in st.session_state:
-        st.session_state.conversation_history = []
-
-    # Sidebar
-    with st.sidebar:
-
-        st.title("Menu")
-
-        api_key = st.text_input(
-            "Enter Google API Key",
-            type="password"
-        )
-
-        st.markdown(
-            "Get API key from: https://ai.google.dev/"
-        )
-
-        pdf_docs = st.file_uploader(
-            "Upload PDF Files",
-            accept_multiple_files=True
-        )
-
-        if st.button("Clear History"):
-            st.session_state.conversation_history = []
-            st.success("History Cleared")
-
-    # User input
     user_question = st.text_input(
-        "Ask a Question from the PDF Files"
+        "Ask a question"
     )
 
-    if user_question:
+    if st.button("Submit"):
 
-        user_input(
-            user_question,
-            api_key,
-            pdf_docs
-        )
+        if not api_key:
+            st.warning("Enter API key")
+            return
 
-    # Show conversation history
-    if st.session_state.conversation_history:
+        if not pdf_docs:
+            st.warning("Upload PDFs")
+            return
 
-        st.markdown("---")
-        st.markdown("## Conversation History")
+        if not user_question:
+            st.warning("Enter question")
+            return
 
-        for chat in reversed(st.session_state.conversation_history):
+        with st.spinner("Processing..."):
 
-            st.markdown(f"### Question")
-            st.write(chat["Question"])
+            raw_text = get_pdf_text(pdf_docs)
 
-            st.markdown(f"### Answer")
-            st.write(chat["Answer"])
+            chunks = chunk_text(raw_text)
 
-            st.caption(chat["Timestamp"])
+            relevant_context = find_relevant_chunks(
+                chunks,
+                user_question
+            )
 
-        # Download CSV
-        df = pd.DataFrame(st.session_state.conversation_history)
+            answer = ask_gemini(
+                api_key,
+                relevant_context,
+                user_question
+            )
 
-        csv = df.to_csv(index=False)
+            st.success("Done")
 
-        b64 = base64.b64encode(csv.encode()).decode()
+            st.markdown("## Answer")
 
-        href = f'''
-        <a href="data:file/csv;base64,{b64}"
-        download="conversation_history.csv">
-        Download Conversation CSV
-        </a>
-        '''
+            st.write(answer)
 
-        st.sidebar.markdown(
-            href,
-            unsafe_allow_html=True
-        )
-
-
-# ---------------- RUN ---------------- #
 
 if __name__ == "__main__":
     main()
-
-
-# Rag
